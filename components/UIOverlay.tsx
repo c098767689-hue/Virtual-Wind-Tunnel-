@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef } from 'react';
-import { ObjectType } from '../types';
+import { ObjectType, TurbulencePreset } from '../types';
 
 interface UIOverlayProps {
   objectType: ObjectType;
@@ -9,6 +9,8 @@ interface UIOverlayProps {
   setWindSpeed: (s: number) => void;
   angle: number;
   setAngle: (a: number) => void;
+  turbulencePreset: TurbulencePreset;
+  setTurbulencePreset: (t: TurbulencePreset) => void;
   showWireframe: boolean;
   setShowWireframe: (b: boolean) => void;
   showSDF: boolean;
@@ -23,6 +25,8 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
   setWindSpeed,
   angle,
   setAngle,
+  turbulencePreset,
+  setTurbulencePreset,
   showWireframe,
   setShowWireframe,
   showSDF,
@@ -37,42 +41,78 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
   // Performance Stats Refs
   const fpsRef = useRef<HTMLSpanElement>(null);
   const msRef = useRef<HTMLSpanElement>(null);
+  const graphRef = useRef<HTMLCanvasElement>(null);
+  const historyRef = useRef<number[]>(new Array(50).fill(60));
 
   // High frequency update loop for metrics & stats to avoid React re-renders on every frame
   useEffect(() => {
     let frameId: number;
-    let lastTime = performance.now();
+    let lastIntervalTime = performance.now();
+    let lastFrameTime = performance.now();
     let frameCount = 0;
 
     const update = () => {
       const now = performance.now();
       
-      // --- Performance Stats Calculation ---
-      frameCount++;
-      const delta = now - lastTime;
+      // --- Graph Update (Every Frame) ---
+      const frameDelta = now - lastFrameTime;
+      lastFrameTime = now;
+      const instantFps = 1000 / Math.max(frameDelta, 0.1);
       
-      // Update stats every 500ms
-      if (delta >= 500) {
-        const fps = Math.round((frameCount * 1000) / delta);
-        const ms = (delta / frameCount).toFixed(2);
+      historyRef.current.push(instantFps);
+      if (historyRef.current.length > 50) historyRef.current.shift();
+
+      if (graphRef.current) {
+        const ctx = graphRef.current.getContext('2d');
+        if (ctx) {
+            const w = graphRef.current.width;
+            const h = graphRef.current.height;
+            ctx.clearRect(0, 0, w, h);
+            
+            ctx.beginPath();
+            // Color based on current performance
+            const currentFps = historyRef.current[historyRef.current.length - 1];
+            ctx.strokeStyle = currentFps < 30 ? '#ef4444' : currentFps < 50 ? '#facc15' : '#4ade80';
+            ctx.lineWidth = 1.5;
+            
+            const max = 120; // Scale to 120 FPS
+            
+            for (let i = 0; i < historyRef.current.length; i++) {
+                const val = historyRef.current[i];
+                const x = (i / 50) * w;
+                // Invert Y (0 is top)
+                const y = h - (Math.min(val, max) / max) * h;
+                
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+        }
+      }
+
+      // --- Text Stats Update (Every 500ms) ---
+      frameCount++;
+      const intervalDelta = now - lastIntervalTime;
+      
+      if (intervalDelta >= 500) {
+        const fps = Math.round((frameCount * 1000) / intervalDelta);
+        const ms = (intervalDelta / frameCount).toFixed(2);
         
         if (fpsRef.current) {
             fpsRef.current.innerText = fps.toString();
-            // Color coding: Green > 50, Yellow > 30, Red < 30
             fpsRef.current.style.color = fps > 50 ? '#4ade80' : fps > 30 ? '#facc15' : '#ef4444';
         }
         if (msRef.current) {
             msRef.current.innerText = `${ms} ms`;
         }
 
-        lastTime = now;
+        lastIntervalTime = now;
         frameCount = 0;
       }
 
       // --- Physics Metrics Update ---
       const { drag, lift, pressure } = metricsRef.current;
       
-      // Update DOM directly
       if (cdRef.current) cdRef.current.innerText = drag.toFixed(3);
       if (liftRef.current) liftRef.current.innerText = Math.floor(lift).toString();
       if (pressRef.current) pressRef.current.innerText = (pressure * 0.01).toFixed(2);
@@ -93,6 +133,13 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
       active 
       ? 'bg-sky-500 text-white border-sky-400 shadow-[0_0_15px_rgba(14,165,233,0.4)]' 
       : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
+    }`;
+
+  const presetBtnClass = (active: boolean) =>
+    `flex-1 py-1.5 px-2 rounded text-[10px] font-bold uppercase tracking-wide border transition-all ${
+        active
+        ? 'bg-purple-500 text-white border-purple-400 shadow-[0_0_10px_rgba(168,85,247,0.4)]'
+        : 'bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700'
     }`;
 
   return (
@@ -123,6 +170,11 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
             <span ref={msRef} className="text-xs font-mono text-sky-400">16.66 ms</span>
           </div>
           <div className="h-6 w-[1px] bg-slate-700"></div>
+          
+          {/* History Graph */}
+          <canvas ref={graphRef} width={50} height={24} className="opacity-90" />
+          
+          <div className="h-6 w-[1px] bg-slate-700"></div>
           <div className="w-2 h-2 rounded-full bg-sky-500 animate-pulse shadow-[0_0_10px_#0ea5e9]"></div>
         </div>
       </div>
@@ -138,7 +190,6 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
           <div className="grid grid-cols-3 gap-2 mb-4">
             <button onClick={() => setObjectType('car')} className={objBtnClass(objectType === 'car')}>Sports Car</button>
             <button onClick={() => setObjectType('cybertruck')} className={objBtnClass(objectType === 'cybertruck')}>Truck</button>
-            <button onClick={() => setObjectType('wing')} className={objBtnClass(objectType === 'wing')}>Airfoil</button>
             <button onClick={() => setObjectType('sphere')} className={objBtnClass(objectType === 'sphere')}>Sphere</button>
             <button onClick={() => setObjectType('cylinder')} className={objBtnClass(objectType === 'cylinder')}>Cylinder</button>
             <button onClick={() => setObjectType('cone')} className={objBtnClass(objectType === 'cone')}>Cone</button>
@@ -205,11 +256,39 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
               </div>
               <input 
                 type="range" 
-                min="-30" max="30" step="1" 
+                min="-180" max="180" step="1" 
                 value={angle}
                 onChange={(e) => setAngle(parseFloat(e.target.value))}
               />
             </div>
+
+            {/* Turbulence Preset */}
+            <div>
+              <div className="flex justify-between text-xs mb-2">
+                <span className="text-slate-400">Flow Condition</span>
+              </div>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => setTurbulencePreset('smooth')} 
+                  className={presetBtnClass(turbulencePreset === 'smooth')}
+                >
+                  Smooth
+                </button>
+                <button 
+                  onClick={() => setTurbulencePreset('chaotic')} 
+                  className={presetBtnClass(turbulencePreset === 'chaotic')}
+                >
+                  Chaotic
+                </button>
+                <button 
+                  onClick={() => setTurbulencePreset('high')} 
+                  className={presetBtnClass(turbulencePreset === 'high')}
+                >
+                  High
+                </button>
+              </div>
+            </div>
+
           </div>
         </div>
       </div>
