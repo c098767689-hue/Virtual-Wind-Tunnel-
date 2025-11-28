@@ -33,11 +33,43 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
   const liftRef = useRef<HTMLDivElement>(null);
   const pressRef = useRef<HTMLDivElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
+  
+  // Performance Stats Refs
+  const fpsRef = useRef<HTMLSpanElement>(null);
+  const msRef = useRef<HTMLSpanElement>(null);
 
-  // High frequency update loop for metrics to avoid React re-renders on every frame
+  // High frequency update loop for metrics & stats to avoid React re-renders on every frame
   useEffect(() => {
     let frameId: number;
+    let lastTime = performance.now();
+    let frameCount = 0;
+
     const update = () => {
+      const now = performance.now();
+      
+      // --- Performance Stats Calculation ---
+      frameCount++;
+      const delta = now - lastTime;
+      
+      // Update stats every 500ms
+      if (delta >= 500) {
+        const fps = Math.round((frameCount * 1000) / delta);
+        const ms = (delta / frameCount).toFixed(2);
+        
+        if (fpsRef.current) {
+            fpsRef.current.innerText = fps.toString();
+            // Color coding: Green > 50, Yellow > 30, Red < 30
+            fpsRef.current.style.color = fps > 50 ? '#4ade80' : fps > 30 ? '#facc15' : '#ef4444';
+        }
+        if (msRef.current) {
+            msRef.current.innerText = `${ms} ms`;
+        }
+
+        lastTime = now;
+        frameCount = 0;
+      }
+
+      // --- Physics Metrics Update ---
       const { drag, lift, pressure } = metricsRef.current;
       
       // Update DOM directly
@@ -79,10 +111,16 @@ export const UIOverlay: React.FC<UIOverlayProps> = ({
           </div>
         </div>
         
-        <div className="px-4 py-2 rounded-full flex items-center gap-3 bg-slate-900/60 backdrop-blur-md border border-white/10 shadow-lg pointer-events-auto">
+        {/* Performance Monitor */}
+        <div className="px-4 py-2 rounded-full flex items-center gap-4 bg-slate-900/60 backdrop-blur-md border border-white/10 shadow-lg pointer-events-auto">
           <div className="flex flex-col items-end">
-            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Physics Rate</span>
-            <span className="text-xs font-mono text-green-400">60 Hz</span>
+            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">FPS</span>
+            <span ref={fpsRef} className="text-xs font-mono text-green-400 transition-colors duration-300">60</span>
+          </div>
+          <div className="h-6 w-[1px] bg-slate-700"></div>
+          <div className="flex flex-col items-end">
+            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Frame Time</span>
+            <span ref={msRef} className="text-xs font-mono text-sky-400">16.66 ms</span>
           </div>
           <div className="h-6 w-[1px] bg-slate-700"></div>
           <div className="w-2 h-2 rounded-full bg-sky-500 animate-pulse shadow-[0_0_10px_#0ea5e9]"></div>

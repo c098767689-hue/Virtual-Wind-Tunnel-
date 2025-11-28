@@ -35,15 +35,15 @@ declare global {
   }
 }
 
-// --- SDF MATH FUNCTIONS (High Precision) ---
+// --- MATH HELPERS (Raw Performance) ---
 
 // Box SDF
-const sdBox = (p: THREE.Vector3, b: THREE.Vector3) => {
-  const dX = Math.abs(p.x) - b.x;
-  const dY = Math.abs(p.y) - b.y;
-  const dZ = Math.abs(p.z) - b.z;
-  const inside = Math.min(Math.max(dX, Math.max(dY, dZ)), 0.0);
-  const outside = Math.sqrt(Math.max(dX, 0) ** 2 + Math.max(dY, 0) ** 2 + Math.max(dZ, 0) ** 2);
+const sdBox = (px: number, py: number, pz: number, bx: number, by: number, bz: number) => {
+  const dx = Math.abs(px) - bx;
+  const dy = Math.abs(py) - by;
+  const dz = Math.abs(pz) - bz;
+  const inside = Math.min(Math.max(dx, Math.max(dy, dz)), 0.0);
+  const outside = Math.sqrt(Math.max(dx, 0) ** 2 + Math.max(dy, 0) ** 2 + Math.max(dz, 0) ** 2);
   return inside + outside;
 };
 
@@ -54,130 +54,183 @@ const smin = (a: number, b: number, k: number) => {
 };
 
 // Capped Cylinder SDF
-const sdCappedCylinder = (p: THREE.Vector3, h: number, r: number) => {
-  const dXZ = Math.sqrt(p.x * p.x + p.z * p.z) - r;
-  const dY = Math.abs(p.y) - h;
+const sdCappedCylinder = (px: number, py: number, pz: number, h: number, r: number) => {
+  const dXZ = Math.sqrt(px * px + pz * pz) - r;
+  const dY = Math.abs(py) - h;
   return Math.min(Math.max(dXZ, dY), 0.0) + Math.sqrt(Math.max(dXZ, 0) ** 2 + Math.max(dY, 0) ** 2);
 };
 
-const getSDF = (pInput: { x: number; y: number; z: number }, type: ObjectType) => {
-  // Reusable Vector3 to avoid allocation in tight loops? 
-  // In JS, allocating small objects in a loop is okay, but for SDF thousands of times per frame, 
-  // we try to keep math raw or simple objects.
-  const p = { x: pInput.x, y: pInput.y, z: pInput.z };
+// 2D Polygon SDF (Raw Math for performance)
+// Verts: flat array [x0, y0, x1, y1, ...]
+const sdPolygonRaw = (px: number, py: number, verts: number[]) => {
+  let d = Infinity;
+  let s = 1.0;
+  const num = verts.length / 2;
+  
+  // Initial distance check (p - v0)^2
+  const v0x = verts[0], v0y = verts[1];
+  d = (px - v0x)**2 + (py - v0y)**2;
 
+  for (let i = 0, j = num - 1; i < num; j = i, i++) {
+    const vix = verts[i*2], viy = verts[i*2+1];
+    const vjx = verts[j*2], vjy = verts[j*2+1];
+    
+    const ex = vjx - vix;
+    const ey = vjy - viy;
+    
+    const wx = px - vix;
+    const wy = py - viy;
+    
+    // clamp(dot(w,e)/dot(e,e), 0, 1)
+    const dotWE = wx*ex + wy*ey;
+    const dotEE = ex*ex + ey*ey;
+    const t = Math.min(Math.max(dotWE / dotEE, 0.0), 1.0);
+    
+    const bx = wx - ex*t;
+    const by = wy - ey*t;
+    
+    d = Math.min(d, bx*bx + by*by);
+    
+    // Winding number logic
+    const c1 = py >= viy;
+    const c2 = py < vjy;
+    const c3 = ex * wy > ey * wx;
+    
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s *= -1.0;
+  }
+  
+  return s * Math.sqrt(d);
+};
+
+// Ellipse Approximation (Gradient-based) for better flow over wings
+const sdEllipseApprox = (y: number, z: number, ry: number, rz: number) => {
+    // Simple scaling approximation is robust enough for this visual sim
+    // d = (length(p/r) - 1) * min(r)
+    // Avoid divide by zero
+    const py = y / (ry > 0 ? ry : 0.01);
+    const pz = z / (rz > 0 ? rz : 0.01);
+    const len = Math.sqrt(py*py + pz*pz);
+    return (len - 1.0) * Math.min(ry, rz);
+};
+
+// --- CURL NOISE GENERATOR (Trigonometric Approximation) ---
+// Generates divergence-free noise field for realistic fluid swirls
+const computeCurl = (x: number, y: number, z: number, time: number) => {
+  const eps = 1e-4; // Finite difference epsilon
+
+  // Potential function (Psi) - A composite of sin/cos waves
+  // We need a vector potential (Psi_x, Psi_y, Psi_z)
+  const potential = (px: number, py: number, pz: number) => {
+    const t = time * 0.5;
+    const scale1 = 1.5;
+    const scale2 = 3.2;
+    
+    // Layer 1
+    let valX = Math.sin(py * scale1 + t) + Math.cos(pz * scale1 - t);
+    let valY = Math.sin(pz * scale1 + t) + Math.cos(px * scale1 - t);
+    let valZ = Math.sin(px * scale1 + t) + Math.cos(py * scale1 - t);
+    
+    // Layer 2 (Detail)
+    valX += 0.5 * Math.sin(pz * scale2 + t * 2.3);
+    valY += 0.5 * Math.sin(px * scale2 + t * 2.3);
+    valZ += 0.5 * Math.sin(py * scale2 + t * 2.3);
+
+    return { x: valX, y: valY, z: valZ };
+  };
+
+  // Curl = (dPsi_z/dy - dPsi_y/dz, dPsi_x/dz - dPsi_z/dx, dPsi_y/dx - dPsi_x/dy)
+  // Approximate derivatives
+  const p0 = potential(x, y, z);
+  const px_ = potential(x + eps, y, z);
+  const py_ = potential(x, y + eps, z);
+  const pz_ = potential(x, y, z + eps);
+
+  const x_rate_y = (py_.x - p0.x) / eps;
+  const x_rate_z = (pz_.x - p0.x) / eps;
+
+  const y_rate_x = (px_.y - p0.y) / eps;
+  const y_rate_z = (pz_.y - p0.y) / eps;
+
+  const z_rate_x = (px_.z - p0.z) / eps;
+  const z_rate_y = (py_.z - p0.z) / eps;
+
+  return {
+    x: z_rate_y - y_rate_z,
+    y: x_rate_z - z_rate_x,
+    z: y_rate_x - x_rate_y
+  };
+};
+
+// --- GEOMETRY DATA ---
+// Cybertruck Profile Vertices (YZ plane, Centered)
+// Visual Height 1.3 -> Center 0.65.
+// Vertices adjusted to be relative to center (0, 0.65, 0)
+const CYBERTRUCK_PROFILE = [
+    2.0, -0.65,  // Rear Bumper Bottom
+    2.0, 0.15,   // Rear Bed Top
+    1.0, 0.65,   // Peak
+    -2.0, 0.05,  // Front Hood Top
+    -2.0, -0.65  // Front Bumper Bottom
+];
+
+const getSDF = (p: { x: number; y: number; z: number }, type: ObjectType) => {
   if (type === 'car') {
     // Car Body (Bottom)
-    // Box: 1.8w, 0.5h, 3.8d -> Half: 0.9, 0.25, 1.9
-    // Position: y = -0.25
-    const pBody = { x: p.x, y: p.y + 0.25, z: p.z };
-    const d1 = sdBox(pBody as THREE.Vector3, { x: 0.9, y: 0.25, z: 1.9 } as THREE.Vector3);
-    
+    const d1 = sdBox(p.x, p.y + 0.25, p.z, 0.9, 0.25, 1.9);
     // Cabin (Top)
-    // Box: 1.4w, 0.5h, 1.8d -> Half: 0.7, 0.25, 0.9
-    // Position: y = 0.25, z = -0.2
-    const pCabin = { x: p.x, y: p.y - 0.25, z: p.z + 0.2 };
-    const d2 = sdBox(pCabin as THREE.Vector3, { x: 0.7, y: 0.25, z: 0.9 } as THREE.Vector3);
-    
-    // Smooth blending to simulate aerodynamic curve
+    const d2 = sdBox(p.x, p.y - 0.25, p.z + 0.2, 0.7, 0.25, 0.9);
+    // Smooth blending
     return smin(d1, d2, 0.15);
   } 
   else if (type === 'cybertruck') {
-    // We need to match the ExtrudeGeometry logic.
-    // The visual mesh is rotated Y by -90 deg relative to standard.
-    // In our physics loop, we handle 'cybertruck' by swapping x/z to align with the mesh's length.
-    // Here, we define the shape assuming P is already in local "Truck Space" (Length along Z).
+    // Extruded Polygon along X (Width)
+    // Profile in YZ plane (Length Z, Height Y)
     
-    // 1. Main lower body box
-    // Width 2.0 (x +/- 1), Height 0.6, Length 4.0 (z +/- 2)
-    const boxLower = sdBox({ x: p.x, y: p.y - 0.3, z: p.z } as THREE.Vector3, { x: 0.95, y: 0.3, z: 2.0 } as THREE.Vector3);
+    // 1. 2D Profile Distance
+    // Note: p.z maps to Profile X (Length), p.y maps to Profile Y (Height)
+    const dPoly = sdPolygonRaw(p.z, p.y, CYBERTRUCK_PROFILE);
     
-    // 2. The Triangle Roof/Bed
-    // We can approximate the angular shape by intersecting planes or a rotated box.
-    // Or simpler: A central triangular prism logic.
+    // 2. Extrusion width (X axis)
+    // Width 1.8 -> Half 0.9
+    const dExtrude = Math.abs(p.x) - 0.9;
     
-    // Sloped Plane 1 (Windshield): Normal pointing forward-up
-    // Normal ~ [0, 1, 1] normalized
-    const nz1 = 0.6; const ny1 = 0.8; // Approximate slope
-    const distPlaneFront = (p.z * nz1 + p.y * ny1) - 0.8; // Offset
-    
-    // Sloped Plane 2 (Bed): Normal pointing back-up
-    const nz2 = -0.5; const ny2 = 0.8;
-    const distPlaneBack = (p.z * nz2 + p.y * ny2) - 0.8;
-
-    // Intersection of Box and Planes (Rough approximation of Cybertruck peak)
-    const boxUpper = sdBox({ x: p.x, y: p.y - 0.6, z: p.z } as THREE.Vector3, { x: 0.95, y: 0.6, z: 2.0 } as THREE.Vector3);
-    
-    // The truck is the intersection of the upper box bounds and the two cutting planes
-    // But actually, smax (intersection) of the box and the space *below* the planes.
-    // Actually, simpler: Union of lower box and a "Tent".
-    
-    // Let's use a simplified approach that fits inside the visual mesh:
-    // A box that gets cut.
-    const rawBox = sdBox({ x: p.x, y: p.y - 0.4, z: p.z } as THREE.Vector3, { x: 0.9, y: 0.6, z: 1.9 } as THREE.Vector3);
-    
-    // Cut front (Windshield)
-    // Z > -2. Plane eqn: y - z - 1 = 0
-    const cutFront = (p.y - (p.z * 0.45) - 0.9);
-    
-    // Cut back (Bed cover)
-    // Z < 2. Plane eqn: y + z - 1 = 0
-    const cutBack = (p.y + (p.z * 0.35) - 0.9);
-    
-    // Intersection: Max(Box, CutFront, CutBack)
-    return Math.max(rawBox, cutFront, cutBack);
+    // Intersection (Max) of Profile and Width
+    const m = Math.max(dPoly, dExtrude);
+    return m;
   } 
   else if (type === 'wing') {
-    // Wing is rotated in physics loop so Length is X, Profile is YZ.
-    // We want a teardrop shape in YZ.
+    // Wing along X axis. Length 4.5.
+    // Cross section in YZ. Elliptical/Airfoil.
+    // Thickness Y=0.2 (Radius), Chord Z=1.0 (Radius).
     
-    // 1. Limit length (X axis)
-    const dX = Math.abs(p.x) - 2.2;
+    // 1. Infinite Elliptical Cylinder
+    const dProfile = sdEllipseApprox(p.y, p.z, 0.2, 1.0);
     
-    // 2. Airfoil Profile in YZ
-    // An airfoil is rounder at front (positive Z in local space?) and sharp at back.
-    // Let's assume Z is flow direction (chord).
-    // Modify Y based on Z.
+    // 2. Cap Length (X axis)
+    const dLength = Math.abs(p.x) - 2.25;
     
-    // Standard NACA-ish look:
-    // Scale Y by a factor that depends on Z
-    // Let's just do a stretched cylinder that tapers.
-    const zNorm = (p.z + 0.5) / 1.5; // Normalize roughly 0 to 1 along chord
-    const thickness = 0.25 * (1.0 - zNorm * 0.8); // Thicker at front
-    const dProfile = Math.sqrt(p.y * p.y * 4.0) - thickness; // Elliptical approx
-    
-    // Simple Flattened Cylinder fallback if the above is unstable
-    const ry = p.y / 0.15; // Thinner
-    const rz = p.z / 1.0;  // Longer
-    const dCyl = Math.sqrt(ry * ry + rz * rz) - 1.0;
-    
-    // Intersection of infinite profile and length cap
-    return Math.max(dCyl * 0.15, dX);
+    // Intersection
+    return Math.max(dProfile, dLength);
   } 
   else if (type === 'sphere') {
     return Math.sqrt(p.x * p.x + p.y * p.y + p.z * p.z) - 1.0;
   } 
   else if (type === 'cylinder') {
-    // Vertical cylinder: r=0.8, h=2 (half-height 1.0)
-    return sdCappedCylinder(p as THREE.Vector3, 1.0, 0.8);
+    return sdCappedCylinder(p.x, p.y, p.z, 1.0, 0.8);
   } 
   else if (type === 'cone') {
-    // Vertical Cone
-    // r1 = 0.8 (bottom), r2 = 0.0 (top), h = 2.0
-    // Simplified exact cone SDF is complex, using capped cone approx
+    // Vertical Cone: r=0.8 bottom, 0 top. h=2.
+    // Approx
     const q = Math.sqrt(p.x * p.x + p.z * p.z);
-    // radius at y: from 0.8 at y=-1 to 0 at y=1
-    // lerp: r = 0.4 * (1 - y)
     const r = 0.4 * (1.0 - p.y);
-    const dSlope = (q - r) * 0.9; // cos(angle) factor approx
+    const dSlope = (q - r) * 0.9; 
     const dHeight = Math.abs(p.y) - 1.0;
     return Math.max(dSlope, dHeight);
   } 
   else if (type === 'torus') {
-    // Torus on XZ plane
-    const t = { x: 1.0, y: 0.3 }; // major, minor
-    const q = { x: Math.sqrt(p.x * p.x + p.z * p.z) - t.x, y: p.y };
-    return Math.sqrt(q.x * q.x + q.y * q.y) - t.y;
+    const tx = 1.0; const ty = 0.3;
+    const qx = Math.sqrt(p.x * p.x + p.z * p.z) - tx;
+    return Math.sqrt(qx * qx + p.y * p.y) - ty;
   }
   return 10.0;
 };
@@ -186,7 +239,6 @@ const getSDF = (pInput: { x: number; y: number; z: number }, type: ObjectType) =
 
 const SDFSlice = ({ objectType, angle }: { objectType: ObjectType; angle: number }) => {
   const pointsRef = useRef<THREE.Points>(null);
-  
   const width = 10;
   const depth = 10;
   const cols = 120;
@@ -222,47 +274,36 @@ const SDFSlice = ({ objectType, angle }: { objectType: ObjectType; angle: number
       for (let c = 0; c < cols; c++) {
         const x = (c / (cols - 1)) * width - width / 2;
         const z = (r / (rows - 1)) * depth - depth / 2;
-        const y = 0;
-
+        
         let lx = x * cosR - z * sinR;
-        let ly = y;
+        let ly = 0;
         let lz = x * sinR + z * cosR;
 
-        // MATCHING TRANSFORM LOGIC
-        if (objectType === 'cybertruck') {
-          // Mesh is rotated -90 Y. 
-          // Physics is local. 
-          // If we pass X,Z to physics, we need to swap them to match the "Long Z" definition in SDF
-          const tmp = lx; lx = -lz; lz = tmp;
-        } else if (objectType === 'wing') {
-          // Wing rotates around X for AoA
+        if (objectType === 'wing') {
+          // Wing is static Y, pitches in X.
+          // Revert World Yaw (since Wing stays 0 yaw visual)
+          lx = x; 
+          const wz = z;
+          
           const radX = -angle * Math.PI / 180;
           const cosX = Math.cos(radX);
           const sinX = Math.sin(radX);
           
-          // Revert the World Y Rotation for Wing (it stays at 0 yaw)
-          // Actually, in TestObject, Wing has `rotation.y = 0`.
-          // So we should NOT apply the `rad` rotation to `lx/lz` above.
-          // Reset to world coords:
-          lx = x; 
-          const wy = y; 
-          const wz = z;
-          
-          // Apply Pitch (X-axis rotation)
-          ly = wy * cosX - wz * sinX;
-          lz = wy * sinX + wz * cosX;
-        }
-
+          ly = 0 * cosX - wz * sinX;
+          lz = 0 * sinX + wz * cosX;
+        } 
+        
         const dist = getSDF({ x: lx, y: ly, z: lz }, objectType);
         
-        // ... Coloring Logic (Same as before) ...
+        // Coloring Logic
         let cr = 0, cg = 0, cb = 0;
         let alpha = 0;
 
         if (dist < 0) {
-           cr = 0.1; cg = 0.2; cb = 0.3; alpha = 0.9; // Solid inside
+           cr = 0.1; cg = 0.2; cb = 0.3; alpha = 0.9;
         } else {
            const d = dist; 
+           // Heatmap Gradient
            if (d < 0.5) { cr = 1.0; cg = d * 2.0; cb = 0.0; } 
            else if (d < 1.0) { cr = 1.0 - (d - 0.5) * 2.0; cg = 1.0; cb = 0.0; } 
            else if (d < 2.0) { cr = 0.0; cg = 1.0 - (d - 1.0) * 0.5; cb = (d - 1.0) * 0.5; } 
@@ -337,7 +378,7 @@ const Particles = ({
     return [pos, col];
   }, []);
 
-  useFrame(() => {
+  useFrame((state) => {
     if (!linesRef.current) return;
     
     const geom = linesRef.current.geometry;
@@ -349,19 +390,21 @@ const Particles = ({
     const physPositions = physicsPosRef.current;
     const velocities = velocitiesRef.current;
     
+    const time = state.clock.elapsedTime;
+    
     const rad = -angle * Math.PI / 180;
     const cosR = Math.cos(rad);
     const sinR = Math.sin(rad);
-
-    let totalPressure = 0;
-    let dragSum = 0;
-    const targetSpeed = windSpeed * 0.4; // Tuned for better visual flow speed
-    const trailFactor = 0.12 + (windSpeed * 0.1); 
-
-    // Pre-calc Wing rotation
+    
+    // Wing specific rotation (Pitch X)
     const radX = -angle * Math.PI / 180;
     const cosX = Math.cos(radX);
     const sinX = Math.sin(radX);
+
+    let totalPressure = 0;
+    let dragSum = 0;
+    const targetSpeed = windSpeed * 0.4;
+    const trailFactor = 0.12 + (windSpeed * 0.1); 
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const pIdx = i * 3;
@@ -379,132 +422,187 @@ const Particles = ({
       let lx, ly, lz;
 
       if (objectType === 'wing') {
-        // Wing is static in Y, rotates in X (Pitch)
         lx = px;
         ly = py * cosX - pz * sinX;
         lz = py * sinX + pz * cosX;
       } else {
-        // Standard Y-Rotation (Yaw)
         lx = px * cosR - pz * sinR;
         ly = py;
         lz = px * sinR + pz * cosR;
-
-        if (objectType === 'cybertruck') {
-          // Fix Coordinate Swap for Cybertruck Extrusion
-          const tmp = lx; lx = -lz; lz = tmp;
-        }
       }
 
       const dist = getSDF({x: lx, y: ly, z: lz}, objectType);
       
-      // IMPROVED: Larger Interaction Distance for smoother avoidance
-      const interactionDist = 0.8; 
+      const interactionDist = 0.5; 
       let pressure = 0;
+      let inBoundaryLayer = false;
+      let isWake = false;
 
       if (dist < interactionDist) {
-        // Calculate Normal (Gradient)
-        // Sample slightly wider for smoother normals on angular shapes
-        const e = 0.05; 
+        // Gradient (Normal) Calculation
+        const e = 0.02; // More precise epsilon
         const nx = getSDF({x: lx + e, y: ly, z: lz}, objectType) - getSDF({x: lx - e, y: ly, z: lz}, objectType);
         const ny = getSDF({x: lx, y: ly + e, z: lz}, objectType) - getSDF({x: lx, y: ly - e, z: lz}, objectType);
         const nz = getSDF({x: lx, y: ly, z: lz + e}, objectType) - getSDF({x: lx, y: ly, z: lz - e}, objectType);
         
-        const len = Math.sqrt(nx*nx + ny*ny + nz*nz);
-        // Safety check for zero gradient (far field or center)
-        const safeLen = len > 0 ? len : 1;
-        const nnx = nx / safeLen; 
-        const nny = ny / safeLen; 
-        const nnz = nz / safeLen;
+        let len = nx*nx + ny*ny + nz*nz;
+        if (len > 0) {
+            len = Math.sqrt(len);
+            const nnx = nx / len; 
+            const nny = ny / len; 
+            const nnz = nz / len;
 
-        // Transform Normal back to World Space
-        let wnx, wny, wnz;
+            // Transform Normal back to World Space
+            let wnx, wny, wnz;
 
-        if (objectType === 'wing') {
-           wnx = nnx;
-           wny = nny * cosX + nnz * sinX;
-           wnz = -nny * sinX + nnz * cosX;
-        } else {
-           let localNx = nnx; let localNz = nnz;
-           if (objectType === 'cybertruck') {
-             const tmp = localNx; localNx = localNz; localNz = -tmp;
-           }
-           wnx = localNx * cosR + localNz * sinR;
-           wny = nny;
-           wnz = -localNx * sinR + localNz * cosR;
-        }
+            if (objectType === 'wing') {
+               wnx = nnx;
+               wny = nny * cosX + nnz * sinX;
+               wnz = -nny * sinX + nnz * cosX;
+            } else {
+               wnx = nnx * cosR + nnz * sinR;
+               wny = nny;
+               wnz = -nnx * sinR + nnz * cosR;
+            }
 
-        const dot = vx * wnx + vy * wny + vz * wnz;
+            const dot = vx * wnx + vy * wny + vz * wnz;
 
-        if (dist < 0.02) {
-          // --- COLLISION RESPONSE (Inside) ---
-          
-          // 1. Hard position correction (push out)
-          const pushOut = (0.02 - dist) + 0.01; // Extra nudge
-          px += wnx * pushOut;
-          py += wny * pushOut;
-          pz += wnz * pushOut;
+            if (dist < 0.05) {
+              // --- HARD COLLISION / IMPACT ---
+              let pushOut = 0;
+              if (dist <= 0) {
+                  // Penetration correction: Snap to surface + slight push
+                  pushOut = -dist + 0.03;
+              } else {
+                  // Cushion
+                  pushOut = (0.05 - dist) * 0.4;
+              }
+              
+              px += wnx * pushOut;
+              py += wny * pushOut;
+              pz += wnz * pushOut;
 
-          // 2. Velocity Reflection or Slide
-          if (dot < 0) {
-            // Remove velocity into the wall (Slide)
-            vx -= dot * wnx;
-            vy -= dot * wny;
-            vz -= dot * wnz;
-            
-            // Add Friction
-            vx *= 0.9; vy *= 0.9; vz *= 0.9;
+              if (dot < 0) {
+                // Bounce/Slide - Friction Logic
+                // Kill normal velocity (No bounce, fluid sticks or slides)
+                vx -= dot * wnx * 1.05; // 1.05 = slight bounce
+                vy -= dot * wny * 1.05;
+                vz -= dot * wnz * 1.05;
+                
+                // Friction (Simulate viscosity near surface)
+                vx *= 0.85; 
+                vy *= 0.85; 
+                vz *= 0.85;
 
-            pressure = 1.0;
-            dragSum += 2.0;
-          }
-        } else {
-          // --- AVOIDANCE RESPONSE (Outside but close) ---
-          
-          // Strength increases as we get closer
-          const proximity = 1.0 - (dist / interactionDist);
-          const steerFactor = Math.pow(proximity, 2) * 2.0; // Non-linear increase
+                pressure = 1.0;
+                dragSum += 2.0;
+              }
+            } else {
+              // --- AVOIDANCE / LAMINAR FLOW ---
+              const proximity = 1.0 - (dist / interactionDist);
+              inBoundaryLayer = true;
 
-          if (dot < 0) {
-            // Steer velocity to be tangent
-            vx -= dot * wnx * steerFactor; 
-            vy -= dot * wny * steerFactor; 
-            vz -= dot * wnz * steerFactor;
-            
-            // Slight repulsion to prevent hitting
-            const repulsion = 0.01 * proximity;
-            vx += wnx * repulsion;
-            vy += wny * repulsion;
-            vz += wnz * repulsion;
-            
-            pressure = proximity * 0.5;
-            dragSum += pressure * 0.1;
-          }
+              if (dot < 0) {
+                // Steer Tangent
+                const steerStrength = Math.pow(proximity, 3) * 2.0;
+                
+                // Remove velocity towards object
+                vx -= dot * wnx * steerStrength; 
+                vy -= dot * wny * steerStrength; 
+                vz -= dot * wnz * steerStrength;
+                
+                // Add soft repulsion to maintain volume
+                const repulsion = 0.005 * proximity;
+                px += wnx * repulsion;
+                py += wny * repulsion;
+                pz += wnz * repulsion;
+                
+                pressure = proximity * 0.6;
+                dragSum += pressure * 0.2;
+              }
+            }
         }
       }
+      
+      // --- ADVANCED TURBULENCE (CURL NOISE) ---
+      
+      // Calculate Curl Noise Vector for this position
+      // Scale coordinates for noise frequency
+      const curl = computeCurl(px * 0.5, py * 0.5, pz * 0.5, time);
+      
+      // 1. Wake Detection (Behind object)
+      // Approximate bounding box check based on object size
+      let zWakeStart = 1.5;
+      let yWakeWidth = 1.0;
+      let xWakeWidth = 1.5;
+      if (objectType === 'wing') { zWakeStart = 1.0; yWakeWidth = 0.3; }
 
-      // Global Wind Acceleration
-      // Smoothly accelerate back to target wind speed
-      const windInertia = 0.03;
+      // Check if particle is "shadowed" by the object
+      if (pz > zWakeStart && Math.abs(px) < xWakeWidth && Math.abs(py) < yWakeWidth) {
+         isWake = true;
+      }
+      
+      // 2. Apply Forces
+      if (isWake) {
+         // --- WAKE TURBULENCE ---
+         // Strong swirling, reduced forward velocity (Drag)
+         const wakeIntensity = 0.04 * windSpeed;
+         vx += curl.x * wakeIntensity;
+         vy += curl.y * wakeIntensity;
+         vz += curl.z * wakeIntensity;
+         
+         // Drag suction
+         vz -= 0.005 * windSpeed; 
+      } else if (inBoundaryLayer) {
+         // --- BOUNDARY LAYER ---
+         // Small micro-turbulences near surface
+         const blIntensity = 0.01 * windSpeed;
+         vx += curl.x * blIntensity;
+         vy += curl.y * blIntensity;
+         
+         // Viscous drag (slow down near surface)
+         vx *= 0.96;
+         vy *= 0.96;
+         vz *= 0.96;
+      } else {
+         // --- FREE STREAM ---
+         // Very subtle ambient air movement
+         const ambientIntensity = 0.002 * windSpeed;
+         vx += curl.x * ambientIntensity;
+         vy += curl.y * ambientIntensity;
+      }
+
+      // 3. Global Wind & Inertia
+      const windInertia = isWake ? 0.01 : 0.05; // Wake has less connection to free stream
       vz += (targetSpeed - vz) * windInertia;
       
-      // Damping lateral movement to stabilize flow
-      vx *= 0.98;
-      vy *= 0.98;
+      // Damping lateral movement to keep stream vaguely straight
+      vx *= 0.99;
+      vy *= 0.99;
 
+      // Integration
       px += vx; py += vy; pz += vz;
 
-      // Bounds Reset
+      // Reset
       let reset = false;
-      if (pz > 8 || Math.abs(px) > 10 || Math.abs(py) > 10) {
-        pz = -8 - Math.random() * 4; // Spawn further back variation
+      const boundsX = 8;
+      const boundsY = 5;
+      const boundsZ = 12;
+      
+      if (pz > boundsZ || Math.abs(px) > boundsX || Math.abs(py) > boundsY) {
+        pz = -8 - Math.random() * 4;
         px = (Math.random() - 0.5) * 6;
         py = (Math.random() - 0.5) * 4;
-        vx = 0; vy = 0; vz = targetSpeed;
+        
+        // Initial velocity with slight random variation
+        vx = (Math.random() - 0.5) * 0.01; 
+        vy = (Math.random() - 0.5) * 0.01; 
+        vz = targetSpeed;
+        
         pressure = 0;
         reset = true;
       }
 
-      // Update Physics Arrays
       physPositions[pIdx] = px;
       physPositions[pIdx+1] = py;
       physPositions[pIdx+2] = pz;
@@ -512,27 +610,29 @@ const Particles = ({
       velocities[pIdx+1] = vy;
       velocities[pIdx+2] = vz;
 
-      // --- RENDER MAPPING ---
-      
+      // Render Update
       const speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
       const normalizedSpeed = Math.min(speed / (targetSpeed * 1.5), 1.0);
 
-      // Render Colors
       let r, g, b;
       if (pressure > 0.1) {
-        // Impact / Pressure color (White/Red)
-        const t = Math.min(pressure, 1.0);
+        const t = Math.min(pressure * 1.2, 1.0);
         r = 1.0; g = 1.0 - t * 0.5; b = 1.0 - t;
         totalPressure += pressure;
       } else {
-        // Flow color (Blue/Cyan/Green based on speed)
-        // Slow (Greenish) -> Fast (Blue/Cyan)
+        // Velocity Color Map
+        // Fast (Laminar) = Cyan/Blue
+        // Slow (Wake/Stagnation) = Deep Blue/Purple
         r = 0.0;
-        g = 0.2 + (1.0 - normalizedSpeed) * 0.5; 
+        g = 0.2 + (1.0 - normalizedSpeed) * 0.6; // More green if slow
         b = 0.5 + normalizedSpeed * 0.5;
+        
+        if (isWake) {
+           // Tint wake particles slightly purple/darker
+           r = 0.2; g *= 0.5; b *= 0.8;
+        }
       }
 
-      // Update Geometry
       renderPositions[rIdx+3] = px;
       renderPositions[rIdx+4] = py;
       renderPositions[rIdx+5] = pz;
@@ -542,7 +642,6 @@ const Particles = ({
          renderPositions[rIdx+1] = py;
          renderPositions[rIdx+2] = pz;
       } else {
-         // Dynamic trail length based on speed
          const lag = trailFactor * 2.5;
          renderPositions[rIdx] = px - vx * lag;
          renderPositions[rIdx+1] = py - vy * lag;
@@ -562,7 +661,6 @@ const Particles = ({
     posAttr.needsUpdate = true;
     colAttr.needsUpdate = true;
 
-    // Metrics Update (Throttled by Frame)
     if (onMetricsUpdate) {
         const lift = Math.sin(angle * Math.PI / 180) * windSpeed * 2000;
         onMetricsUpdate({
@@ -605,6 +703,9 @@ const TestObject = ({ type, angle, showWireframe }: { type: ObjectType; angle: n
   
   const cyberTruckGeo = useMemo(() => {
     const shape = new THREE.Shape();
+    // Profile matches vertices used in SDF (shifted by +0.65 to be 0..1.3 range relative to bottom)
+    // Vertices in SDF are Centered Y (-0.65 to 0.65). 
+    // Shape uses coordinates relative to anchor. ExtrudeGeometry centers it later.
     shape.moveTo(0, 0);
     shape.lineTo(2, 0);
     shape.lineTo(2, 0.8);
@@ -613,15 +714,19 @@ const TestObject = ({ type, angle, showWireframe }: { type: ObjectType; angle: n
     shape.lineTo(-2, 0);
     const extrudeSettings = { depth: 1.8, bevelEnabled: false };
     const geo = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-    geo.center();
-    geo.rotateY(-Math.PI / 2); // Visual Rotation adjustment
+    geo.center(); 
+    geo.rotateY(-Math.PI / 2); // Align Width to X, Length to Z
     return geo;
   }, []);
 
   const wingGeo = useMemo(() => {
+    // Correct Order: 
+    // 1. Create Cylinder (Axis Y).
+    // 2. Rotate Z 90 -> Axis X.
+    // 3. Scale -> X (Length) stays 1x (4.5), Y (Thickness) becomes 0.2x, Z (Chord) stays 1x.
     const geo = new THREE.CylinderGeometry(1, 1, 4.5, 64);
-    geo.scale(1, 0.2, 1);
     geo.rotateZ(Math.PI / 2);
+    geo.scale(1, 0.2, 1);
     return geo;
   }, []);
 
@@ -636,11 +741,13 @@ const TestObject = ({ type, angle, showWireframe }: { type: ObjectType; angle: n
     if (type === 'car') {
         if (groupRef.current) groupRef.current.rotation.y = rRad;
     } else if (type === 'cybertruck') {
-        if (meshRef.current) meshRef.current.rotation.y = rRad - Math.PI/2; 
+        // Fix: Removed extra rotation. The geometry is already aligned to Width X, Length Z.
+        // Just apply angle of attack.
+        if (meshRef.current) meshRef.current.rotation.y = rRad; 
     } else if (type === 'wing') {
         if (meshRef.current) {
-            meshRef.current.rotation.y = 0; // Wing stays straight in Yaw
-            meshRef.current.rotation.x = rRad; // Wing pitches in X
+            meshRef.current.rotation.y = 0; 
+            meshRef.current.rotation.x = rRad;
         }
     } else {
         if (meshRef.current) meshRef.current.rotation.y = rRad;
