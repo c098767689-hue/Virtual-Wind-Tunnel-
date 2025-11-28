@@ -1,0 +1,5 @@
+{
+  "name": "AeroLab SDF Simulator",
+  "description": "A high-precision wind tunnel simulator using Signed Distance Functions (SDF) for real-time fluid dynamics approximation in the browser.",
+  "requestFramePermissions": []
+}
